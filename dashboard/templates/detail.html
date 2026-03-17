@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}MeetScribe — Transcript{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <!-- Header -->
+    <div class="flex justify-between items-start">
+        <div>
+            <a href="/" class="text-sm text-indigo-600 hover:text-indigo-800 mb-2 inline-block">&larr; Back to Dashboard</a>
+            <h1 class="text-2xl font-bold text-gray-900">Transcript</h1>
+            <div class="flex items-center space-x-3 mt-2">
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                    {% if transcript.platform.value == 'webex' %}bg-green-100 text-green-800
+                    {% elif transcript.platform.value == 'zoom' %}bg-blue-100 text-blue-800
+                    {% else %}bg-yellow-100 text-yellow-800{% endif %}">
+                    {{ transcript.platform.value | replace('_', ' ') | title }}
+                </span>
+                <span class="text-sm text-gray-500">{{ transcript.created_at.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+                <span class="text-sm text-gray-500">{{ "%.1f" | format(transcript.duration_seconds / 60) }} min</span>
+            </div>
+            <p class="text-sm text-gray-500 mt-1">{{ transcript.meeting_url }}</p>
+        </div>
+        <div class="flex space-x-2">
+            <a href="/api/transcripts/{{ transcript.id }}/download?format=md"
+               class="bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-3 py-1.5 rounded-md text-sm transition-colors">
+                Download MD
+            </a>
+            <a href="/api/transcripts/{{ transcript.id }}/download?format=txt"
+               class="bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-3 py-1.5 rounded-md text-sm transition-colors">
+                Download TXT
+            </a>
+            <a href="/api/transcripts/{{ transcript.id }}/download?format=json"
+               class="bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-3 py-1.5 rounded-md text-sm transition-colors">
+                Download JSON
+            </a>
+            <button onclick="copyTranscript()"
+                    class="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-md text-sm transition-colors">
+                Copy to Clipboard
+            </button>
+        </div>
+    </div>
+
+    <!-- Transcript Content -->
+    <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
+        <div id="transcript-content" class="space-y-4">
+            {% set current_speaker = namespace(value='') %}
+            {% for seg in transcript.segments %}
+                {% if seg.speaker != current_speaker.value %}
+                    {% set current_speaker.value = seg.speaker %}
+                    <div class="mt-4 first:mt-0">
+                        <div class="flex items-center space-x-2 mb-1">
+                            <span class="font-semibold text-gray-900">{{ seg.speaker }}</span>
+                            <span class="text-xs text-gray-400">
+                                {% set mins = (seg.start_time // 60) | int %}
+                                {% set secs = (seg.start_time % 60) | int %}
+                                {{ "%02d:%02d" | format(mins, secs) }}
+                            </span>
+                        </div>
+                {% endif %}
+                        <p class="text-gray-700 leading-relaxed transcript-segment pl-4">{{ seg.text }}</p>
+                {% if loop.last or transcript.segments[loop.index0 + 1].speaker != current_speaker.value %}
+                    </div>
+                {% endif %}
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<script>
+function copyTranscript() {
+    const el = document.getElementById('transcript-content');
+    const text = el.innerText;
+    navigator.clipboard.writeText(text).then(() => {
+        const btn = event.target;
+        const original = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = original, 2000);
+    });
+}
+</script>
+{% endblock %}

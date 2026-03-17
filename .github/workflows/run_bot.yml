@@ -1,0 +1,135 @@
+name: Deploy MeetScribe Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      meeting_url:
+        description: "Meeting URL or ID"
+        required: true
+        type: string
+      display_name:
+        description: "Bot display name in meeting"
+        required: false
+        default: "MeetScribe"
+        type: string
+      platform:
+        description: "Meeting platform"
+        required: true
+        type: choice
+        options:
+          - webex
+          - zoom
+          - google_meet
+
+jobs:
+  record-and-transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            xvfb pulseaudio pulseaudio-utils ffmpeg \
+            fonts-liberation libnss3 libatk-bridge2.0-0 \
+            libdrm2 libxcomposite1 libxdamage1 libxrandr2 \
+            libgbm1 libasound2
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium && python -m playwright install-deps chromium
+
+      - name: Start virtual devices
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+          sleep 1
+          pulseaudio --start --exit-idle-time=-1 || true
+          sleep 1
+          pactl load-module module-null-sink sink_name=MeetScribe sink_properties=device.description=MeetScribe || true
+          pactl set-default-sink MeetScribe || true
+          pactl set-default-source MeetScribe.monitor || true
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+
+      - name: Run bot (record meeting)
+        run: |
+          python -m bot.engine \
+            --platform "${{ github.event.inputs.platform }}" \
+            --meeting-url "${{ github.event.inputs.meeting_url }}" \
+            --display-name "${{ github.event.inputs.display_name }}"
+        env:
+          RECORDINGS_DIR: ./recordings
+          WHISPER_MODEL: small
+          WHISPER_COMPUTE_TYPE: int8
+
+      - name: Transcribe recording
+        run: |
+          python -c "
+          import asyncio, glob, json
+          from transcriber.whisper_engine import WhisperTranscriber
+          from transcriber.diarizer import diarize_by_silence, merge_short_segments, format_transcript_markdown
+
+          async def main():
+              wav_files = glob.glob('recordings/*.wav')
+              if not wav_files:
+                  print('No recordings found')
+                  return
+
+              audio = wav_files[-1]  # Most recent
+              print(f'Transcribing: {audio}')
+
+              t = WhisperTranscriber()
+              result = await t.transcribe(audio)
+
+              diarized = diarize_by_silence(result)
+              diarized = merge_short_segments(diarized)
+
+              # Save markdown
+              md = format_transcript_markdown(diarized)
+              with open('transcript.md', 'w') as f:
+                  f.write(md)
+
+              # Save JSON
+              data = {
+                  'segments': [{'speaker': s.speaker, 'start': s.start, 'end': s.end, 'text': s.text} for s in diarized],
+                  'full_text': result.full_text,
+                  'language': result.language,
+                  'duration_seconds': result.duration_seconds,
+              }
+              with open('transcript.json', 'w') as f:
+                  json.dump(data, f, indent=2)
+
+              print(f'Transcription complete: {len(diarized)} segments')
+
+          asyncio.run(main())
+          "
+
+      - name: Upload transcript artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: meetscribe-transcript
+          path: |
+            transcript.md
+            transcript.json
+          retention-days: 90
+
+      - name: Upload audio recording
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: meetscribe-audio
+          path: recordings/
+          retention-days: 30

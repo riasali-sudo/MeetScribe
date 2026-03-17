@@ -1,0 +1,22 @@
+services:
+  meetscribe:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./recordings:/app/recordings
+      - ./transcripts:/app/transcripts
+      - ./data:/app/data
+    environment:
+      - DISPLAY_NAME=${DISPLAY_NAME:-MeetScribe}
+      - WHISPER_MODEL=${WHISPER_MODEL:-small}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+      - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-int8}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DATABASE_PATH=/app/data/meetscribe.db
+      - RECORDINGS_DIR=/app/recordings
+      - TRANSCRIPTS_DIR=/app/transcripts
+    shm_size: "2gb"
+    security_opt:
+      - seccomp:unconfined
+    restart: unless-stopped

@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% block title %}MeetScribe — Join Meeting{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto">
+    <h1 class="text-2xl font-bold text-gray-900 mb-6">Deploy Recording Bot</h1>
+
+    <form id="join-form" class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 space-y-5">
+        <!-- Platform -->
+        <div>
+            <label for="platform" class="block text-sm font-medium text-gray-700 mb-1">Platform</label>
+            <select id="platform" name="platform" required
+                    class="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+                <option value="webex">Webex</option>
+                <option value="zoom">Zoom</option>
+                <option value="google_meet">Google Meet</option>
+            </select>
+        </div>
+
+        <!-- Meeting URL -->
+        <div>
+            <label for="meeting_url" class="block text-sm font-medium text-gray-700 mb-1">Meeting URL or ID</label>
+            <input type="text" id="meeting_url" name="meeting_url" required
+                   placeholder="https://example.webex.com/meet/john or meeting number"
+                   class="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+            <p id="url-hint" class="mt-1 text-xs text-gray-500">
+                Paste the full meeting link or enter the meeting number/code.
+            </p>
+        </div>
+
+        <!-- Display Name -->
+        <div>
+            <label for="display_name" class="block text-sm font-medium text-gray-700 mb-1">Bot Display Name</label>
+            <input type="text" id="display_name" name="display_name"
+                   value="{{ default_name }}"
+                   class="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+            <p class="mt-1 text-xs text-gray-500">This name will appear in the meeting participant list.</p>
+        </div>
+
+        <!-- Submit -->
+        <button type="submit" id="submit-btn"
+                class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2.5 px-4 rounded-lg transition-colors">
+            Deploy Bot
+        </button>
+    </form>
+
+    <!-- Status Display -->
+    <div id="status-area" class="mt-6 hidden">
+        <div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
+            <h2 class="text-lg font-semibold text-gray-900 mb-3">Bot Status</h2>
+            <div id="status-content" class="space-y-2">
+                <!-- Populated by JS -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Platform Tips -->
+    <div class="mt-6 bg-white rounded-lg shadow-sm border border-gray-200 p-6">
+        <h2 class="text-lg font-semibold text-gray-900 mb-3">Platform Tips</h2>
+        <div class="space-y-3 text-sm text-gray-600">
+            <div>
+                <h3 class="font-medium text-gray-800">Webex</h3>
+                <p>Use the full meeting link (e.g., https://company.webex.com/meet/user) or the numeric meeting ID. The bot joins as a guest — no Webex account needed.</p>
+            </div>
+            <div>
+                <h3 class="font-medium text-gray-800">Zoom</h3>
+                <p>Paste the Zoom invite link. Include the passcode in the URL if required. The bot joins via the browser web client.</p>
+            </div>
+            <div>
+                <h3 class="font-medium text-gray-800">Google Meet</h3>
+                <p>Use the meeting link (e.g., https://meet.google.com/xxx-yyyy-zzz). The host may need to admit the bot from the waiting room.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const form = document.getElementById('join-form');
+const statusArea = document.getElementById('status-area');
+const statusContent = document.getElementById('status-content');
+const submitBtn = document.getElementById('submit-btn');
+
+// Update URL hint based on platform
+document.getElementById('platform').addEventListener('change', (e) => {
+    const hints = {
+        webex: 'Paste the full meeting link or enter the meeting number.',
+        zoom: 'Paste the Zoom invite link (passcode included).',
+        google_meet: 'Enter the meeting link or code (xxx-xxxx-xxx).'
+    };
+    document.getElementById('url-hint').textContent = hints[e.target.value] || '';
+});
+
+form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Deploying...';
+
+    const body = {
+        platform: document.getElementById('platform').value,
+        meeting_url: document.getElementById('meeting_url').value,
+        display_name: document.getElementById('display_name').value,
+    };
+
+    try {
+        const resp = await fetch('/api/bot/join', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Failed to deploy bot');
+        }
+
+        const bot = await resp.json();
+        statusArea.classList.remove('hidden');
+        updateStatus(bot);
+        pollStatus(bot.id);
+    } catch (err) {
+        statusArea.classList.remove('hidden');
+        statusContent.innerHTML = `<p class="text-red-600">${err.message}</p>`;
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Deploy Bot';
+    }
+});
+
+function updateStatus(bot) {
+    const colors = {
+        joining: 'bg-yellow-100 text-yellow-800',
+        recording: 'bg-red-100 text-red-800',
+        transcribing: 'bg-blue-100 text-blue-800',
+        completed: 'bg-green-100 text-green-800',
+        failed: 'bg-red-100 text-red-800',
+    };
+    const badgeClass = colors[bot.status] || 'bg-gray-100 text-gray-800';
+
+    statusContent.innerHTML = `
+        <div class="flex items-center space-x-2">
+            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${badgeClass}">
+                ${bot.status.toUpperCase()}
+            </span>
+            <span class="text-sm text-gray-500">Bot ID: ${bot.id.slice(0, 8)}...</span>
+        </div>
+        ${bot.error ? `<p class="text-sm text-red-600 mt-1">${bot.error}</p>` : ''}
+        ${bot.status === 'completed' ? '<p class="text-sm text-green-600 mt-1">Recording and transcription complete! <a href="/" class="underline">View transcripts</a></p>' : ''}
+        ${bot.status === 'recording' ? '<p class="text-sm text-gray-500 mt-1 animate-pulse">Recording in progress...</p>' : ''}
+        ${bot.status === 'transcribing' ? '<p class="text-sm text-gray-500 mt-1 animate-pulse">Transcribing audio...</p>' : ''}
+    `;
+
+    if (bot.status === 'completed' || bot.status === 'failed') {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Deploy Bot';
+    }
+}
+
+async function pollStatus(botId) {
+    const interval = setInterval(async () => {
+        try {
+            const resp = await fetch(`/api/bot/${botId}`);
+            if (!resp.ok) return;
+            const bot = await resp.json();
+            updateStatus(bot);
+            if (bot.status === 'completed' || bot.status === 'failed') {
+                clearInterval(interval);
+            }
+        } catch (err) {
+            console.error('Poll error:', err);
+        }
+    }, 5000);
+}
+</script>
+{% endblock %}
