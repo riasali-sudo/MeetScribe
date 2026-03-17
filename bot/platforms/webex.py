@@ -64,37 +64,45 @@ class WebexJoiner(PlatformJoiner):
         await self._save_debug(page, "02_after_modal_click")
         logger.info("Page title: %s | URL: %s", await page.title(), page.url)
 
-        # Log page state to debug what loaded
+        # The guest join form is inside an iframe (web.webex.com).
+        # Find the right frame to interact with.
+        target_frame = await self._find_guest_join_frame(page)
+
+        if target_frame:
+            logger.info("Found guest join iframe — interacting inside frame")
+        else:
+            logger.warning("No guest iframe found, falling back to main page")
+            target_frame = page
+
+        # Log frame state
         try:
-            text = await page.evaluate(
+            text = await target_frame.evaluate(
                 "() => document.body ? document.body.innerText.substring(0, 3000) : '(empty)'"
             )
-            logger.info("Page text after modal:\n%s", text)
-            counts = await page.evaluate("""() => ({
-                buttons: document.querySelectorAll('button').length,
-                inputs: document.querySelectorAll('input').length,
-                iframes: document.querySelectorAll('iframe').length,
-            })""")
-            logger.info("Element counts: %s", counts)
+            logger.info("Frame text:\n%s", text)
         except Exception as e:
-            logger.warning("Could not read page state: %s", e)
+            logger.warning("Could not read frame state: %s", e)
 
-        # Step 3: Dismiss cookie banner again (may reappear on new page)
+        # Step 3: Dismiss cookie banner again (may reappear)
         await self._dismiss_cookies(page)
 
-        # Step 4: Fill in Name field
-        await self._fill_name(page, display_name)
+        # Step 4: Fill in Name field (inside iframe)
+        await self._fill_name(target_frame, display_name)
 
-        # Step 5: Fill in Email (optional but may help avoid issues)
-        await self._fill_email(page)
+        # Step 5: Fill in Email (inside iframe)
+        await self._fill_email(target_frame)
 
-        # Step 6: Mute mic and stop video
+        # Step 6: Mute mic and stop video (may be in main page or iframe)
         await self._mute_av(page)
+        await self._mute_av(target_frame)
 
         await self._save_debug(page, "03_before_join")
 
-        # Step 7: Click "Join meeting" button
-        joined = await self._click_join_meeting(page)
+        # Step 7: Click "Join meeting" button (inside iframe)
+        joined = await self._click_join_meeting(target_frame)
+        if not joined:
+            # Also try main page
+            joined = await self._click_join_meeting(page)
         if not joined:
             logger.error("Could not click 'Join meeting' button")
             await self._save_debug(page, "04_join_failed")
@@ -160,6 +168,45 @@ class WebexJoiner(PlatformJoiner):
                 continue
 
     # ── Private helpers ───────────────────────────────────────────────
+
+    async def _find_guest_join_frame(self, page: Page):
+        """Find the iframe containing the guest join form.
+
+        The Webex guest join form lives inside an iframe from web.webex.com.
+        Returns the Frame object if found, None otherwise.
+        """
+        for frame in page.frames:
+            url = frame.url
+            logger.info("Frame URL: %s", url[:120])
+
+            # The guest join form iframe
+            if "web.webex.com" in url or "guest" in url.lower():
+                # Verify it has inputs (the form)
+                try:
+                    input_count = await frame.evaluate(
+                        "() => document.querySelectorAll('input').length"
+                    )
+                    logger.info("Frame %s has %d inputs", url[:60], input_count)
+                    if input_count > 0:
+                        return frame
+                except Exception:
+                    continue
+
+        # Fallback: find any frame with visible input elements
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            try:
+                has_inputs = await frame.evaluate(
+                    "() => document.querySelectorAll('input[type=\"text\"], input[type=\"email\"], input:not([type])').length > 0"
+                )
+                if has_inputs:
+                    logger.info("Found frame with inputs: %s", frame.url[:80])
+                    return frame
+            except Exception:
+                continue
+
+        return None
 
     async def _dismiss_cookies(self, page: Page) -> None:
         """Dismiss cookie consent banner if present."""
@@ -241,21 +288,9 @@ class WebexJoiner(PlatformJoiner):
 
         logger.warning("Could not find 'Join from browser' modal button")
 
-    async def _fill_name(self, page: Page, name: str) -> None:
-        """Fill in the Name field on the guest join form."""
-        # The form has a "Name *" label — try label-based lookup first
-        try:
-            name_input = page.get_by_label("Name", exact=False).first
-            if await name_input.is_visible():
-                await name_input.click()
-                await name_input.fill("")
-                await name_input.type(name, delay=random.randint(50, 120))
-                logger.info("Filled Name field via label")
-                return
-        except Exception:
-            pass
-
-        # Fallback: try placeholder/attribute selectors
+    async def _fill_name(self, target, name: str) -> None:
+        """Fill in the Name field. target can be Page or Frame."""
+        # Try attribute-based selectors (work on both Page and Frame)
         selectors = [
             'input[placeholder*="name" i]',
             'input[aria-label*="name" i]',
@@ -264,7 +299,7 @@ class WebexJoiner(PlatformJoiner):
         ]
         for sel in selectors:
             try:
-                el = await page.wait_for_selector(sel, timeout=3000)
+                el = await target.wait_for_selector(sel, timeout=3000)
                 if el and await el.is_visible():
                     await el.click()
                     await el.fill("")
@@ -274,9 +309,11 @@ class WebexJoiner(PlatformJoiner):
             except Exception:
                 continue
 
-        # Last resort: find the first visible text input
+        # Last resort: first visible text input in the frame
         try:
-            inputs = await page.query_selector_all('input[type="text"], input:not([type])')
+            inputs = await target.query_selector_all(
+                'input[type="text"], input:not([type])'
+            )
             for inp in inputs:
                 if await inp.is_visible():
                     await inp.click()
@@ -288,30 +325,18 @@ class WebexJoiner(PlatformJoiner):
 
         logger.warning("Could not find Name input field")
 
-    async def _fill_email(self, page: Page) -> None:
-        """Fill in Email field with a disposable address (optional)."""
-        try:
-            email_input = page.get_by_label("Email", exact=False).first
-            if await email_input.is_visible():
-                await email_input.click()
-                await email_input.fill("")
-                await email_input.type(
-                    "meetscribe@example.com", delay=random.randint(50, 100)
-                )
-                logger.info("Filled Email field")
-                return
-        except Exception:
-            pass
-
-        # Fallback
+    async def _fill_email(self, target) -> None:
+        """Fill in Email field. target can be Page or Frame."""
         selectors = [
-            'input[placeholder*="email" i]',
             'input[type="email"]',
+            'input[placeholder*="email" i]',
             'input[aria-label*="email" i]',
+            'input[id*="email" i]',
+            'input[name*="email" i]',
         ]
         for sel in selectors:
             try:
-                el = await page.wait_for_selector(sel, timeout=2000)
+                el = await target.wait_for_selector(sel, timeout=2000)
                 if el and await el.is_visible():
                     await el.click()
                     await el.fill("meetscribe@example.com")
@@ -320,39 +345,41 @@ class WebexJoiner(PlatformJoiner):
             except Exception:
                 continue
 
-    async def _mute_av(self, page: Page) -> None:
-        """Click Mute and Stop Video buttons."""
-        for label in ["Mute", "Stop video"]:
+    async def _mute_av(self, target) -> None:
+        """Click Mute and Stop Video buttons. target can be Page or Frame."""
+        for aria in ["Mute", "Stop video", "Turn off camera", "mute"]:
             try:
-                btn = page.get_by_text(label, exact=False).first
-                if await btn.is_visible():
-                    await btn.click()
-                    logger.info("Clicked '%s'", label)
-                    await random_delay(0.5, 1)
-            except Exception:
-                continue
-
-        # Also try aria-label versions
-        for aria in ["Mute", "Stop video", "Turn off camera"]:
-            try:
-                btn = await page.query_selector(f'button[aria-label*="{aria}" i]')
+                btn = await target.query_selector(f'button[aria-label*="{aria}" i]')
                 if btn and await btn.is_visible():
                     await btn.click()
+                    logger.info("Clicked AV button: %s", aria)
             except Exception:
                 continue
 
-    async def _click_join_meeting(self, page: Page) -> bool:
-        """Click the 'Join meeting' button on the guest join form."""
-        # Exact match first
+        # Also try text-based selectors
+        for sel in [
+            'button:has-text("Mute")',
+            'button:has-text("Stop video")',
+        ]:
+            try:
+                el = await target.query_selector(sel)
+                if el and await el.is_visible():
+                    await el.click()
+            except Exception:
+                continue
+
+    async def _click_join_meeting(self, target) -> bool:
+        """Click 'Join meeting' button. target can be Page or Frame."""
         selectors = [
             'button:has-text("Join meeting")',
             'button:has-text("Join Meeting")',
-            'input[value*="Join" i]',
             'button:has-text("Join")',
+            'input[value*="Join" i]',
+            '[role="button"]:has-text("Join")',
         ]
         for sel in selectors:
             try:
-                el = await page.wait_for_selector(sel, timeout=5000)
+                el = await target.wait_for_selector(sel, timeout=5000)
                 if el and await el.is_visible():
                     await el.click()
                     logger.info("Clicked join via: %s", sel)
@@ -360,23 +387,15 @@ class WebexJoiner(PlatformJoiner):
             except Exception:
                 continue
 
-        # get_by_role
+        # Scan all buttons
         try:
-            btn = page.get_by_role("button", name="Join meeting")
-            if await btn.count() > 0 and await btn.first.is_visible():
-                await btn.first.click()
-                logger.info("Clicked 'Join meeting' via get_by_role")
-                return True
-        except Exception:
-            pass
-
-        # Broad text match
-        try:
-            loc = page.get_by_text("Join meeting", exact=False).first
-            if await loc.is_visible():
-                await loc.click()
-                logger.info("Clicked 'Join meeting' via get_by_text")
-                return True
+            buttons = await target.query_selector_all("button")
+            for btn in buttons:
+                text = (await btn.inner_text()).strip().lower()
+                if "join" in text and await btn.is_visible():
+                    await btn.click()
+                    logger.info("Clicked join button by scan: '%s'", text)
+                    return True
         except Exception:
             pass
 
