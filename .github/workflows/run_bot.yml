@@ -66,6 +66,9 @@ jobs:
           pactl set-default-source MeetScribe.monitor || true
           echo "DISPLAY=:99" >> $GITHUB_ENV
 
+      - name: Create output directories
+        run: mkdir -p recordings transcripts
+
       - name: Run bot (record meeting)
         run: |
           python -m bot.engine \
@@ -136,3 +139,12 @@ jobs:
           name: meetscribe-audio
           path: recordings/
           retention-days: 30
+
+      - name: Upload debug screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: meetscribe-debug
+          path: recordings/debug_*.png
+          if-no-files-found: ignore
+          retention-days: 7

@@ -121,6 +121,16 @@ class BotEngine:
                 )
 
                 if not joined:
+                    # Save debug screenshot
+                    debug_path = str(
+                        settings.recordings_dir / "debug_failed_join.png"
+                    )
+                    try:
+                        await page.screenshot(path=debug_path, full_page=True)
+                        logger.info("Debug screenshot saved: %s", debug_path)
+                    except Exception as ss_err:
+                        logger.warning("Could not save screenshot: %s", ss_err)
+
                     return BotResult(
                         audio_path="",
                         duration_seconds=0,
