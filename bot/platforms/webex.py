@@ -1,4 +1,10 @@
-"""Webex meeting joiner — guest join via public web client."""
+"""Webex meeting joiner — guest join via public web client.
+
+Flow observed from debug screenshots:
+1. Landing page: "Join your Webex meeting" with "Join from this browser" button
+2. Cookie consent banner (Accept/Reject)
+3. Guest join page: Name*, Email Address fields, Preview, Mute/Stop video, "Join meeting" button
+"""
 
 from __future__ import annotations
 
@@ -6,10 +12,10 @@ import logging
 import random
 import re
 
-from playwright.async_api import Page, FrameLocator
+from playwright.async_api import Page
 
 from bot.platforms.base import PlatformJoiner
-from bot.stealth import human_like_click, random_delay
+from bot.stealth import random_delay
 
 logger = logging.getLogger(__name__)
 
@@ -21,16 +27,13 @@ class WebexJoiner(PlatformJoiner):
         """Convert meeting input to a joinable Webex URL."""
         meeting_input = meeting_input.strip()
 
-        # Already a full URL
         if re.match(r"https?://.*\.webex\.com/", meeting_input):
             return meeting_input
 
-        # Numeric meeting ID
         cleaned = re.sub(r"[\s\-]", "", meeting_input)
         if cleaned.isdigit() and len(cleaned) >= 9:
             return f"https://web.webex.com/meet?meetingId={cleaned}"
 
-        # Personal room slug
         if "." in meeting_input and "/" not in meeting_input:
             return f"https://{meeting_input}"
 
@@ -42,101 +45,54 @@ class WebexJoiner(PlatformJoiner):
         logger.info("Navigating to Webex: %s", url)
 
         await page.goto(url, wait_until="load", timeout=90000)
+        await random_delay(5, 8)
 
-        # Webex is a heavy SPA — give it time to fully render
-        logger.info("Waiting for Webex page to fully load...")
-        await random_delay(8, 12)
+        # Debug state
+        logger.info("Page title: %s | URL: %s", await page.title(), page.url)
+        await self._save_debug(page, "01_initial_load")
 
-        # Debug: log page title and URL after load
-        logger.info("Page title: %s", await page.title())
-        logger.info("Page URL: %s", page.url)
+        # Step 1: Dismiss cookie banner
+        await self._dismiss_cookies(page)
 
-        # Debug: dump visible text to help identify the page state
-        await self._log_page_state(page)
+        # Step 2: Click "Join from this browser" on the landing page
+        await self._click_join_from_browser(page)
+        await random_delay(8, 12)  # Web client takes time to load
 
-        # Save a screenshot for debugging
-        try:
-            await page.screenshot(path="recordings/debug_webex_loaded.png", full_page=True)
-            logger.info("Saved initial page screenshot")
-        except Exception as e:
-            logger.warning("Could not save screenshot: %s", e)
+        await self._save_debug(page, "02_after_join_browser")
+        logger.info("Page URL after join-from-browser: %s", page.url)
 
-        # Step 1: Look for "Join as a guest" / "Guest" button
-        guest_clicked = await self._find_and_click(
-            page,
-            texts=["Join as a guest", "Join as guest", "Guest", "Use web app"],
-            description="guest join button",
-        )
-        if guest_clicked:
-            logger.info("Clicked guest join option")
-            await random_delay(3, 6)
-            await self._log_page_state(page)
+        # Step 3: Dismiss cookie banner again (may reappear on new page)
+        await self._dismiss_cookies(page)
 
-        # Step 2: Try to find and fill the name input
-        # Strategy: search all input elements on the page
-        name_filled = await self._fill_name_input(page, display_name)
-        if not name_filled:
-            # Try inside iframes
-            for frame in page.frames:
-                if frame == page.main_frame:
-                    continue
-                logger.info("Checking frame: %s", frame.url[:80])
-                name_filled = await self._fill_name_input_in_frame(frame, display_name)
-                if name_filled:
-                    break
+        # Step 4: Fill in Name field
+        await self._fill_name(page, display_name)
 
-        if not name_filled:
-            logger.warning("Could not find name input, continuing without it")
+        # Step 5: Fill in Email (optional but may help avoid issues)
+        await self._fill_email(page)
 
-        await random_delay(1, 3)
+        # Step 6: Mute mic and stop video
+        await self._mute_av(page)
 
-        # Step 3: Mute mic and camera (best effort)
-        await self._try_mute(page)
+        await self._save_debug(page, "03_before_join")
 
-        # Step 4: Click the join/start button
-        joined = await self._find_and_click(
-            page,
-            texts=["Join meeting", "Join", "Start meeting", "Connect"],
-            description="join button",
-        )
-
+        # Step 7: Click "Join meeting" button
+        joined = await self._click_join_meeting(page)
         if not joined:
-            # Try inside iframes
-            for frame in page.frames:
-                if frame == page.main_frame:
-                    continue
-                joined = await self._find_and_click_in_frame(
-                    frame,
-                    texts=["Join meeting", "Join", "Start meeting", "Connect"],
-                    description="join button (iframe)",
-                )
-                if joined:
-                    break
-
-        if not joined:
-            # Last resort: try clicking any green/primary button
-            joined = await self._click_primary_button(page)
-
-        if not joined:
-            logger.error("Could not find join button")
-            try:
-                await page.screenshot(
-                    path="recordings/debug_no_join_button.png", full_page=True
-                )
-            except Exception:
-                pass
+            logger.error("Could not click 'Join meeting' button")
+            await self._save_debug(page, "04_join_failed")
             return False
 
-        logger.info("Clicked join button, waiting for meeting to start...")
-        await random_delay(8, 15)
+        logger.info("Clicked 'Join meeting', waiting to enter...")
+        await random_delay(10, 15)
 
-        # Step 5: Wait up to 5 minutes for meeting to load
+        # Step 8: Wait to be admitted / meeting to start
         for attempt in range(30):
             if await self.is_in_meeting(page):
-                logger.info("Successfully joined Webex meeting")
+                logger.info("Successfully joined Webex meeting!")
                 return True
             if attempt % 5 == 0:
-                logger.info("Waiting for meeting... (attempt %d/30)", attempt + 1)
+                logger.info("Waiting for meeting admission... (attempt %d/30)", attempt + 1)
+                await self._save_debug(page, f"05_waiting_{attempt}")
             await random_delay(8, 12)
 
         logger.error("Timed out waiting to join meeting")
@@ -144,82 +100,112 @@ class WebexJoiner(PlatformJoiner):
 
     async def is_in_meeting(self, page: Page) -> bool:
         """Check if currently in an active Webex meeting."""
-        # Check for typical in-meeting indicators
         indicators = [
-            '[data-test="participant-list"]',
-            '[aria-label*="participant" i]',
-            '[aria-label*="Leave" i]',
             'button:has-text("Leave")',
-            '[aria-label*="Mute" i]',
-            ".meeting-controls",
-            "#meeting-container",
-            '[class*="meeting"]',
+            '[aria-label*="Leave" i]',
+            '[aria-label*="participant" i]',
+            '[data-test="participant-list"]',
             '[data-test*="meeting"]',
+            '.meeting-controls',
         ]
         for selector in indicators:
             try:
                 el = await page.query_selector(selector)
-                if el:
+                if el and await el.is_visible():
                     return True
             except Exception:
                 continue
 
-        # Also check page title — Webex typically shows meeting info in title
-        title = await page.title()
-        if title and any(kw in title.lower() for kw in ["meeting", "webex"]):
-            # Check if there's a leave button visible (means we're in)
-            try:
-                leave = await page.query_selector('button:has-text("Leave")')
-                if leave:
-                    return True
-            except Exception:
-                pass
+        # Check page text for meeting indicators
+        try:
+            body_text = await page.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
+            if any(kw in body_text for kw in ["Recording", "Participants", "Leave meeting"]):
+                return True
+        except Exception:
+            pass
 
         return False
 
     async def leave_meeting(self, page: Page) -> None:
         """Leave the Webex meeting."""
         logger.info("Leaving Webex meeting")
-        await self._find_and_click(
-            page,
-            texts=["Leave meeting", "Leave", "End meeting", "End"],
-            description="leave button",
-        )
-        await random_delay(2, 4)
+        for text in ["Leave meeting", "Leave"]:
+            try:
+                btn = page.get_by_text(text, exact=False).first
+                if await btn.is_visible():
+                    await btn.click()
+                    await random_delay(2, 3)
+                    return
+            except Exception:
+                continue
 
-    # ── Helper methods ────────────────────────────────────────────────
+    # ── Private helpers ───────────────────────────────────────────────
 
-    async def _log_page_state(self, page: Page) -> None:
-        """Log visible text on page for debugging."""
+    async def _dismiss_cookies(self, page: Page) -> None:
+        """Dismiss cookie consent banner if present."""
+        for text in ["Accept", "Reject", "Accept All"]:
+            try:
+                btn = page.get_by_role("button", name=text)
+                if await btn.count() > 0 and await btn.first.is_visible():
+                    await btn.first.click()
+                    logger.info("Dismissed cookie banner: clicked '%s'", text)
+                    await random_delay(1, 2)
+                    return
+            except Exception:
+                continue
+
+    async def _click_join_from_browser(self, page: Page) -> None:
+        """Click 'Join from this browser' on the landing page."""
+        selectors = [
+            'button:has-text("Join from this browser")',
+            'button:has-text("Join from browser")',
+            'div:has-text("Join from this browser")',
+            'button:has-text("Use web app")',
+        ]
+        for sel in selectors:
+            try:
+                el = await page.wait_for_selector(sel, timeout=5000)
+                if el and await el.is_visible():
+                    await el.click()
+                    logger.info("Clicked: %s", sel)
+                    return
+            except Exception:
+                continue
+
+        # Fallback: use get_by_text
         try:
-            # Get all visible text (truncated)
-            text = await page.evaluate(
-                "() => document.body ? document.body.innerText.substring(0, 2000) : '(empty)'"
-            )
-            logger.info("Page text (first 2000 chars):\n%s", text)
+            loc = page.get_by_text("Join from this browser", exact=False).first
+            if await loc.is_visible():
+                await loc.click()
+                logger.info("Clicked 'Join from this browser' via get_by_text")
+                return
+        except Exception:
+            pass
 
-            # Count interactive elements
-            counts = await page.evaluate("""() => ({
-                buttons: document.querySelectorAll('button').length,
-                inputs: document.querySelectorAll('input').length,
-                links: document.querySelectorAll('a').length,
-                iframes: document.querySelectorAll('iframe').length,
-            })""")
-            logger.info("Page elements: %s", counts)
-        except Exception as e:
-            logger.warning("Could not read page state: %s", e)
+        logger.warning("Could not find 'Join from this browser' — may already be on join page")
 
-    async def _fill_name_input(self, page: Page, name: str) -> bool:
-        """Try to fill name input on the main page."""
-        # Strategy 1: labeled inputs
+    async def _fill_name(self, page: Page, name: str) -> None:
+        """Fill in the Name field on the guest join form."""
+        # The form has a "Name *" label — try label-based lookup first
+        try:
+            name_input = page.get_by_label("Name", exact=False).first
+            if await name_input.is_visible():
+                await name_input.click()
+                await name_input.fill("")
+                await name_input.type(name, delay=random.randint(50, 120))
+                logger.info("Filled Name field via label")
+                return
+        except Exception:
+            pass
+
+        # Fallback: try placeholder/attribute selectors
         selectors = [
             'input[placeholder*="name" i]',
-            'input[placeholder*="Name" i]',
             'input[aria-label*="name" i]',
-            'input[aria-label*="Name" i]',
             'input[id*="name" i]',
-            'input[data-test*="name" i]',
-            '#guest-name',
+            'input[name*="name" i]',
         ]
         for sel in selectors:
             try:
@@ -228,124 +214,124 @@ class WebexJoiner(PlatformJoiner):
                     await el.click()
                     await el.fill("")
                     await el.type(name, delay=random.randint(50, 120))
-                    logger.info("Filled name input via: %s", sel)
-                    return True
+                    logger.info("Filled Name field via: %s", sel)
+                    return
             except Exception:
                 continue
 
-        # Strategy 2: find any visible text input
+        # Last resort: find the first visible text input
         try:
             inputs = await page.query_selector_all('input[type="text"], input:not([type])')
             for inp in inputs:
                 if await inp.is_visible():
-                    placeholder = await inp.get_attribute("placeholder") or ""
-                    aria = await inp.get_attribute("aria-label") or ""
-                    logger.info("Found visible input: placeholder=%s, aria=%s", placeholder, aria)
                     await inp.click()
-                    await inp.fill("")
-                    await inp.type(name, delay=random.randint(50, 120))
-                    logger.info("Filled first visible text input with name")
-                    return True
+                    await inp.fill(name)
+                    logger.info("Filled first visible text input as Name")
+                    return
         except Exception:
             pass
 
-        return False
+        logger.warning("Could not find Name input field")
 
-    async def _fill_name_input_in_frame(self, frame, name: str) -> bool:
-        """Try to fill name input inside an iframe."""
+    async def _fill_email(self, page: Page) -> None:
+        """Fill in Email field with a disposable address (optional)."""
         try:
-            inputs = await frame.query_selector_all('input[type="text"], input:not([type])')
-            for inp in inputs:
-                if await inp.is_visible():
-                    await inp.click()
-                    await inp.fill("")
-                    await inp.type(name, delay=random.randint(50, 120))
-                    logger.info("Filled name input in iframe")
-                    return True
-        except Exception:
-            pass
-        return False
-
-    async def _find_and_click(
-        self, page: Page, texts: list[str], description: str
-    ) -> bool:
-        """Find and click an element matching any of the given text patterns."""
-        for text in texts:
-            # Try button
-            for tag in ["button", "a", '[role="button"]']:
-                selector = f'{tag}:has-text("{text}")'
-                try:
-                    el = await page.wait_for_selector(selector, timeout=3000)
-                    if el and await el.is_visible():
-                        await el.click()
-                        logger.info("Clicked %s: %s >> %s", description, tag, text)
-                        return True
-                except Exception:
-                    continue
-
-        # Fallback: search by text content with locator API
-        for text in texts:
-            try:
-                locator = page.get_by_text(text, exact=False)
-                if await locator.count() > 0:
-                    first = locator.first
-                    if await first.is_visible():
-                        await first.click()
-                        logger.info("Clicked %s via get_by_text: %s", description, text)
-                        return True
-            except Exception:
-                continue
-
-        return False
-
-    async def _find_and_click_in_frame(
-        self, frame, texts: list[str], description: str
-    ) -> bool:
-        """Find and click inside an iframe."""
-        for text in texts:
-            for tag in ["button", "a", '[role="button"]']:
-                selector = f'{tag}:has-text("{text}")'
-                try:
-                    el = await frame.wait_for_selector(selector, timeout=2000)
-                    if el and await el.is_visible():
-                        await el.click()
-                        logger.info("Clicked %s in iframe: %s", description, text)
-                        return True
-                except Exception:
-                    continue
-        return False
-
-    async def _click_primary_button(self, page: Page) -> bool:
-        """Last resort: click any prominent/primary action button."""
-        try:
-            buttons = await page.query_selector_all("button")
-            for btn in buttons:
-                if not await btn.is_visible():
-                    continue
-                text = (await btn.inner_text()).strip().lower()
-                classes = await btn.get_attribute("class") or ""
-                # Look for primary/action buttons
-                if any(kw in text for kw in ["join", "start", "connect", "enter"]):
-                    await btn.click()
-                    logger.info("Clicked primary button: '%s'", text)
-                    return True
-                if any(kw in classes.lower() for kw in ["primary", "action", "cta", "btn-join"]):
-                    await btn.click()
-                    logger.info("Clicked button with primary class: '%s'", text)
-                    return True
-        except Exception as e:
-            logger.warning("Primary button search failed: %s", e)
-        return False
-
-    async def _try_mute(self, page: Page) -> None:
-        """Best-effort mute of mic and camera."""
-        mute_texts = ["Mute", "mute", "Stop video", "Turn off camera"]
-        for text in mute_texts:
-            try:
-                el = await page.wait_for_selector(
-                    f'button[aria-label*="{text}" i]', timeout=2000
+            email_input = page.get_by_label("Email", exact=False).first
+            if await email_input.is_visible():
+                await email_input.click()
+                await email_input.fill("")
+                await email_input.type(
+                    "meetscribe@example.com", delay=random.randint(50, 100)
                 )
+                logger.info("Filled Email field")
+                return
+        except Exception:
+            pass
+
+        # Fallback
+        selectors = [
+            'input[placeholder*="email" i]',
+            'input[type="email"]',
+            'input[aria-label*="email" i]',
+        ]
+        for sel in selectors:
+            try:
+                el = await page.wait_for_selector(sel, timeout=2000)
                 if el and await el.is_visible():
                     await el.click()
+                    await el.fill("meetscribe@example.com")
+                    logger.info("Filled Email field via: %s", sel)
+                    return
             except Exception:
                 continue
+
+    async def _mute_av(self, page: Page) -> None:
+        """Click Mute and Stop Video buttons."""
+        for label in ["Mute", "Stop video"]:
+            try:
+                btn = page.get_by_text(label, exact=False).first
+                if await btn.is_visible():
+                    await btn.click()
+                    logger.info("Clicked '%s'", label)
+                    await random_delay(0.5, 1)
+            except Exception:
+                continue
+
+        # Also try aria-label versions
+        for aria in ["Mute", "Stop video", "Turn off camera"]:
+            try:
+                btn = await page.query_selector(f'button[aria-label*="{aria}" i]')
+                if btn and await btn.is_visible():
+                    await btn.click()
+            except Exception:
+                continue
+
+    async def _click_join_meeting(self, page: Page) -> bool:
+        """Click the 'Join meeting' button on the guest join form."""
+        # Exact match first
+        selectors = [
+            'button:has-text("Join meeting")',
+            'button:has-text("Join Meeting")',
+            'input[value*="Join" i]',
+            'button:has-text("Join")',
+        ]
+        for sel in selectors:
+            try:
+                el = await page.wait_for_selector(sel, timeout=5000)
+                if el and await el.is_visible():
+                    await el.click()
+                    logger.info("Clicked join via: %s", sel)
+                    return True
+            except Exception:
+                continue
+
+        # get_by_role
+        try:
+            btn = page.get_by_role("button", name="Join meeting")
+            if await btn.count() > 0 and await btn.first.is_visible():
+                await btn.first.click()
+                logger.info("Clicked 'Join meeting' via get_by_role")
+                return True
+        except Exception:
+            pass
+
+        # Broad text match
+        try:
+            loc = page.get_by_text("Join meeting", exact=False).first
+            if await loc.is_visible():
+                await loc.click()
+                logger.info("Clicked 'Join meeting' via get_by_text")
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    async def _save_debug(self, page: Page, label: str) -> None:
+        """Save a debug screenshot."""
+        try:
+            path = f"recordings/debug_webex_{label}.png"
+            await page.screenshot(path=path, full_page=True)
+            logger.info("Debug screenshot: %s", path)
+        except Exception as e:
+            logger.warning("Could not save debug screenshot %s: %s", label, e)
