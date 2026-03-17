@@ -26,6 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 6 hours max
 
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,7 +46,7 @@ jobs:
             xvfb pulseaudio pulseaudio-utils ffmpeg \
             fonts-liberation libnss3 libatk-bridge2.0-0 \
             libdrm2 libxcomposite1 libxdamage1 libxrandr2 \
-            libgbm1 libasound2
+            libgbm1 libasound2t64
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt

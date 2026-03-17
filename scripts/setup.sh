@@ -20,7 +20,7 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
         libxdamage1 \
         libxrandr2 \
         libgbm1 \
-        libasound2
+        libasound2t64
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     echo "macOS detected. Install dependencies via Homebrew:"
     echo "  brew install ffmpeg"
