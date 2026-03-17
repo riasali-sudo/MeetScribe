@@ -56,10 +56,28 @@ class WebexJoiner(PlatformJoiner):
 
         # Step 2: Click "Join from this browser" on the landing page
         await self._click_join_from_browser(page)
-        await random_delay(8, 12)  # Web client takes time to load
 
-        await self._save_debug(page, "02_after_join_browser")
-        logger.info("Page URL after join-from-browser: %s", page.url)
+        # The web client (guest join form) takes significant time to load
+        logger.info("Waiting for web client to load after modal click...")
+        await random_delay(12, 18)
+
+        await self._save_debug(page, "02_after_modal_click")
+        logger.info("Page title: %s | URL: %s", await page.title(), page.url)
+
+        # Log page state to debug what loaded
+        try:
+            text = await page.evaluate(
+                "() => document.body ? document.body.innerText.substring(0, 3000) : '(empty)'"
+            )
+            logger.info("Page text after modal:\n%s", text)
+            counts = await page.evaluate("""() => ({
+                buttons: document.querySelectorAll('button').length,
+                inputs: document.querySelectorAll('input').length,
+                iframes: document.querySelectorAll('iframe').length,
+            })""")
+            logger.info("Element counts: %s", counts)
+        except Exception as e:
+            logger.warning("Could not read page state: %s", e)
 
         # Step 3: Dismiss cookie banner again (may reappear on new page)
         await self._dismiss_cookies(page)
@@ -157,34 +175,71 @@ class WebexJoiner(PlatformJoiner):
                 continue
 
     async def _click_join_from_browser(self, page: Page) -> None:
-        """Click 'Join from this browser' on the landing page."""
-        selectors = [
+        """Click 'Join from this browser' on the landing page.
+
+        Observed flow:
+        1. Click the "Join from this browser" card on the landing page
+        2. A modal dialog appears: "Let's make sure you're on time for your meeting"
+           with a black "Join from browser" button
+        3. Click that button to proceed to the guest join form
+        """
+        # Step A: Click the "Join from this browser" card
+        card_selectors = [
             'button:has-text("Join from this browser")',
-            'button:has-text("Join from browser")',
             'div:has-text("Join from this browser")',
-            'button:has-text("Use web app")',
         ]
-        for sel in selectors:
+        for sel in card_selectors:
             try:
                 el = await page.wait_for_selector(sel, timeout=5000)
                 if el and await el.is_visible():
                     await el.click()
-                    logger.info("Clicked: %s", sel)
+                    logger.info("Clicked card: %s", sel)
+                    break
+            except Exception:
+                continue
+
+        await random_delay(2, 4)
+
+        # Step B: A modal appears with "Join from browser" button — click it
+        logger.info("Looking for 'Join from browser' modal button...")
+        modal_selectors = [
+            'button:has-text("Join from browser")',
+            'button:text-is("Join from browser")',
+            'a:has-text("Join from browser")',
+        ]
+        for sel in modal_selectors:
+            try:
+                el = await page.wait_for_selector(sel, timeout=8000)
+                if el and await el.is_visible():
+                    await el.click()
+                    logger.info("Clicked modal button: %s", sel)
                     return
             except Exception:
                 continue
 
-        # Fallback: use get_by_text
+        # Fallback: use get_by_role for the modal button
         try:
-            loc = page.get_by_text("Join from this browser", exact=False).first
-            if await loc.is_visible():
-                await loc.click()
-                logger.info("Clicked 'Join from this browser' via get_by_text")
+            btn = page.get_by_role("button", name="Join from browser")
+            if await btn.count() > 0 and await btn.first.is_visible():
+                await btn.first.click()
+                logger.info("Clicked 'Join from browser' via get_by_role")
                 return
         except Exception:
             pass
 
-        logger.warning("Could not find 'Join from this browser' — may already be on join page")
+        # Last fallback: click any button with "Join" and "browser" text
+        try:
+            buttons = await page.query_selector_all("button")
+            for btn in buttons:
+                text = (await btn.inner_text()).strip().lower()
+                if "join" in text and "browser" in text and await btn.is_visible():
+                    await btn.click()
+                    logger.info("Clicked modal join button by scanning: '%s'", text)
+                    return
+        except Exception:
+            pass
+
+        logger.warning("Could not find 'Join from browser' modal button")
 
     async def _fill_name(self, page: Page, name: str) -> None:
         """Fill in the Name field on the guest join form."""
