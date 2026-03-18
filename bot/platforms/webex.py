@@ -91,11 +91,12 @@ class WebexJoiner(PlatformJoiner):
 
         await self._save_debug(page, "04_before_join")
 
-        # Step 8: Click "Join meeting" button inside iframe
-        joined = await self._click_join_in_frame(guest_frame)
-        if not joined:
-            # Fallback: try main page
-            joined = await self._click_join_in_frame(page)
+        # Debug: log all frames
+        for i, frame in enumerate(page.frames):
+            logger.info("Frame[%d]: url=%s", i, frame.url[:120])
+
+        # Step 8: Click "Join meeting" button — search ALL frames and main page
+        joined = await self._click_join_button_anywhere(page, guest_frame)
         if not joined:
             logger.error("Could not click 'Join meeting' button")
             await self._save_debug(page, "05_join_failed")
@@ -343,59 +344,140 @@ class WebexJoiner(PlatformJoiner):
             except Exception:
                 continue
 
-    async def _click_join_in_frame(self, frame) -> bool:
-        """Click the Join meeting button in a frame.
+    async def _click_join_button_anywhere(self, page: Page, guest_frame) -> bool:
+        """Search ALL frames and the main page for the 'Join meeting' button.
 
-        The button may be disabled until form fields are filled.
-        We wait briefly then try to click, including force-click if needed.
+        The Webex UI sometimes places the button in the main page even though
+        the form inputs are inside a cross-origin iframe.
         """
         await random_delay(2, 3)  # Let form validation settle
 
-        # Log all buttons for debugging
+        # Try each frame context: guest iframe first, then main page, then all frames
+        contexts = [("guest_frame", guest_frame), ("main_page", page)]
+        for frame in page.frames:
+            if frame != page.main_frame and frame != guest_frame:
+                contexts.append((f"frame:{frame.url[:60]}", frame))
+
+        for ctx_name, ctx in contexts:
+            logger.info("Searching for join button in: %s", ctx_name)
+            result = await self._click_join_in_context(ctx, ctx_name)
+            if result:
+                return True
+
+        return False
+
+    async def _click_join_in_context(self, frame, ctx_name: str) -> bool:
+        """Try to click the Join meeting button in a single frame/page context."""
+        # Log all clickable elements for debugging
         try:
-            buttons = await frame.query_selector_all("button")
-            for btn in buttons:
-                text = (await btn.inner_text()).strip()
-                disabled = await btn.get_attribute("disabled")
-                is_vis = await btn.is_visible()
-                logger.info("Button: text='%s' disabled=%s visible=%s", text[:50], disabled, is_vis)
+            for tag in ["button", "a", "[role='button']"]:
+                elements = await frame.query_selector_all(tag)
+                for el in elements:
+                    text = (await el.inner_text()).strip()
+                    is_vis = await el.is_visible()
+                    if text and ("join" in text.lower() or is_vis):
+                        disabled = await el.get_attribute("disabled")
+                        tag_name = await el.evaluate("e => e.tagName")
+                        logger.info(
+                            "[%s] Element: tag=%s text='%s' disabled=%s visible=%s",
+                            ctx_name, tag_name, text[:60], disabled, is_vis,
+                        )
         except Exception:
             pass
 
-        # Try exact selectors
+        # Strategy 1: CSS selectors for button-like elements
         for sel in [
             'button:has-text("Join meeting")',
             'button:has-text("Join Meeting")',
+            'a:has-text("Join meeting")',
+            '[role="button"]:has-text("Join meeting")',
             'button:has-text("Join")',
+            'a:has-text("Join")',
         ]:
             try:
-                el = await frame.wait_for_selector(sel, timeout=5000)
-                if el:
-                    is_visible = await el.is_visible()
-                    disabled = await el.get_attribute("disabled")
-                    logger.info("Found join button: sel=%s visible=%s disabled=%s", sel, is_visible, disabled)
-
-                    if is_visible:
-                        try:
-                            await el.click(timeout=3000)
-                            logger.info("Clicked join via: %s", sel)
-                            return True
-                        except Exception:
-                            # Force click if regular click fails (e.g., disabled overlay)
-                            await el.click(force=True)
-                            logger.info("Force-clicked join via: %s", sel)
-                            return True
+                el = await frame.wait_for_selector(sel, timeout=3000)
+                if el and await el.is_visible():
+                    try:
+                        await el.click(timeout=3000)
+                        logger.info("[%s] Clicked join via: %s", ctx_name, sel)
+                        return True
+                    except Exception:
+                        await el.click(force=True)
+                        logger.info("[%s] Force-clicked join via: %s", ctx_name, sel)
+                        return True
             except Exception:
                 continue
 
-        # Scan all buttons as fallback
+        # Strategy 2: get_by_role (Playwright's recommended approach)
         try:
-            buttons = await frame.query_selector_all("button")
-            for btn in buttons:
-                text = (await btn.inner_text()).strip().lower()
-                if "join" in text and "browser" not in text:
-                    await btn.click(force=True)
-                    logger.info("Force-clicked join by scan: '%s'", text)
+            btn = frame.get_by_role("button", name="Join meeting")
+            if await btn.count() > 0:
+                first = btn.first
+                if await first.is_visible():
+                    await first.click()
+                    logger.info("[%s] Clicked via get_by_role('button', 'Join meeting')", ctx_name)
+                    return True
+                else:
+                    await first.click(force=True)
+                    logger.info("[%s] Force-clicked via get_by_role", ctx_name)
+                    return True
+        except Exception:
+            pass
+
+        # Strategy 3: get_by_text
+        try:
+            el = frame.get_by_text("Join meeting", exact=True).first
+            if await el.is_visible():
+                await el.click()
+                logger.info("[%s] Clicked via get_by_text('Join meeting')", ctx_name)
+                return True
+        except Exception:
+            pass
+
+        # Strategy 4: JavaScript click — finds ANY element with matching text
+        try:
+            clicked = await frame.evaluate("""() => {
+                const texts = ['Join meeting', 'Join Meeting'];
+                for (const text of texts) {
+                    // Check buttons, anchors, and role=button elements
+                    const all = document.querySelectorAll('button, a, [role="button"], input[type="submit"]');
+                    for (const el of all) {
+                        if (el.textContent.trim().includes(text) || el.value === text) {
+                            el.click();
+                            return text;
+                        }
+                    }
+                    // TreeWalker to find text nodes anywhere
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_TEXT,
+                        { acceptNode: n => n.textContent.trim().includes(text) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT }
+                    );
+                    let node = walker.nextNode();
+                    while (node) {
+                        let target = node.parentElement;
+                        if (target) {
+                            target.click();
+                            return 'text-node:' + text;
+                        }
+                        node = walker.nextNode();
+                    }
+                }
+                return null;
+            }""")
+            if clicked:
+                logger.info("[%s] JS-clicked join button: %s", ctx_name, clicked)
+                return True
+        except Exception as e:
+            logger.info("[%s] JS click failed: %s", ctx_name, e)
+
+        # Strategy 5: Scan all visible elements with "join" text
+        try:
+            elements = await frame.query_selector_all("button, a, [role='button'], div[tabindex]")
+            for el in elements:
+                text = (await el.inner_text()).strip().lower()
+                if "join" in text and "browser" not in text and "mobile" not in text:
+                    await el.click(force=True)
+                    logger.info("[%s] Force-clicked by scan: '%s'", ctx_name, text)
                     return True
         except Exception:
             pass
