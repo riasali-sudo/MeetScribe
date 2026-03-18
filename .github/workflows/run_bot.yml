@@ -70,6 +70,7 @@ jobs:
         run: mkdir -p recordings transcripts
 
       - name: Run bot (record meeting)
+        id: bot
         run: |
           python -m bot.engine \
             --platform "${{ github.event.inputs.platform }}" \
@@ -80,21 +81,41 @@ jobs:
           WHISPER_MODEL: small
           WHISPER_COMPUTE_TYPE: int8
 
+      - name: Derive file base name
+        id: names
+        if: always()
+        run: |
+          # Find the most recent .wav to extract the base name
+          # Format: {platform}_{meeting_id}_{YYYYMMDD_HHMMSS}.wav
+          WAV=$(ls -t recordings/*.wav 2>/dev/null | head -1 || true)
+          if [ -n "$WAV" ]; then
+            BASE=$(basename "$WAV" .wav)
+          else
+            PLATFORM="${{ github.event.inputs.platform }}"
+            TS=$(date -u +%Y%m%d_%H%M%S)
+            BASE="${PLATFORM}_unknown_${TS}"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "File base name: $BASE"
+
       - name: Transcribe recording
         run: |
           python -c "
-          import asyncio, glob, json
+          import asyncio, glob, json, os
+          from pathlib import Path
           from transcriber.whisper_engine import WhisperTranscriber
           from transcriber.diarizer import diarize_by_silence, merge_short_segments, format_transcript_markdown
 
           async def main():
-              wav_files = glob.glob('recordings/*.wav')
+              wav_files = sorted(glob.glob('recordings/*.wav'), key=os.path.getmtime, reverse=True)
+              wav_files = [f for f in wav_files if not Path(f).name.startswith('_')]
               if not wav_files:
                   print('No recordings found')
                   return
 
-              audio = wav_files[-1]  # Most recent
-              print(f'Transcribing: {audio}')
+              audio = wav_files[0]
+              base = Path(audio).stem  # e.g. webex_m2f0e3fe_20260318_012300
+              print(f'Transcribing: {audio} (base: {base})')
 
               t = WhisperTranscriber()
               result = await t.transcribe(audio)
@@ -102,22 +123,27 @@ jobs:
               diarized = diarize_by_silence(result)
               diarized = merge_short_segments(diarized)
 
-              # Save markdown
-              md = format_transcript_markdown(diarized)
-              with open('transcript.md', 'w') as f:
-                  f.write(md)
+              out_dir = Path('transcripts')
+              out_dir.mkdir(exist_ok=True)
 
-              # Save JSON
+              # Save markdown: transcripts/{platform}_{meeting_id}_{timestamp}.md
+              md = format_transcript_markdown(diarized)
+              md_path = out_dir / f'{base}.md'
+              md_path.write_text(md)
+
+              # Save JSON: transcripts/{platform}_{meeting_id}_{timestamp}.json
               data = {
+                  'base_name': base,
                   'segments': [{'speaker': s.speaker, 'start': s.start, 'end': s.end, 'text': s.text} for s in diarized],
                   'full_text': result.full_text,
                   'language': result.language,
                   'duration_seconds': result.duration_seconds,
               }
-              with open('transcript.json', 'w') as f:
-                  json.dump(data, f, indent=2)
+              json_path = out_dir / f'{base}.json'
+              json_path.write_text(json.dumps(data, indent=2))
 
               print(f'Transcription complete: {len(diarized)} segments')
+              print(f'Saved: {md_path}, {json_path}')
 
           asyncio.run(main())
           "
@@ -126,25 +152,25 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: meetscribe-transcript
-          path: |
-            transcript.md
-            transcript.json
+          name: transcript-${{ steps.names.outputs.base }}
+          path: transcripts/
           retention-days: 90
 
       - name: Upload audio recording
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: meetscribe-audio
-          path: recordings/
+          name: audio-${{ steps.names.outputs.base }}
+          path: |
+            recordings/*.wav
+            !recordings/_*.wav
           retention-days: 30
 
       - name: Upload debug screenshots
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: meetscribe-debug
+          name: debug-${{ steps.names.outputs.base }}
           path: recordings/debug_*.png
           if-no-files-found: ignore
           retention-days: 7

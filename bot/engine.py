@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import signal
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import async_playwright
 
@@ -40,6 +42,8 @@ class BotResult:
     duration_seconds: float
     platform: str
     meeting_url: str
+    meeting_id: str
+    base_name: str
     status: str
     error: str | None = None
 
@@ -69,7 +73,9 @@ class BotEngine:
     async def run(self) -> BotResult:
         """Run the full bot lifecycle: launch → join → record → leave."""
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        audio_filename = f"{self._platform}_{timestamp}.wav"
+        meeting_id = self._extract_meeting_id(self._meeting_url)
+        base_name = f"{self._platform}_{meeting_id}_{timestamp}"
+        audio_filename = f"{base_name}.wav"
         audio_path = str(settings.recordings_dir / audio_filename)
 
         # Ensure output directory exists
@@ -142,6 +148,8 @@ class BotEngine:
                         duration_seconds=0,
                         platform=self._platform,
                         meeting_url=self._meeting_url,
+                        meeting_id=meeting_id,
+                        base_name=base_name,
                         status="failed",
                         error="Failed to join meeting",
                     )
@@ -189,6 +197,8 @@ class BotEngine:
                     duration_seconds=duration,
                     platform=self._platform,
                     meeting_url=self._meeting_url,
+                    meeting_id=meeting_id,
+                    base_name=base_name,
                     status="completed",
                 )
 
@@ -200,6 +210,8 @@ class BotEngine:
                     duration_seconds=self._recorder.duration_seconds,
                     platform=self._platform,
                     meeting_url=self._meeting_url,
+                    meeting_id=meeting_id,
+                    base_name=base_name,
                     status="failed",
                     error=str(e),
                 )
@@ -211,6 +223,54 @@ class BotEngine:
         """Signal the bot to stop recording and leave."""
         logger.info("Shutdown requested")
         self._shutdown_requested = True
+
+    @staticmethod
+    def _extract_meeting_id(url: str) -> str:
+        """Extract a short meeting identifier from the URL.
+
+        Examples:
+          https://hcaconnect.webex.com/hcaconnect/j.php?MTID=m2f0e3... → m2f0e3
+          https://hcaconnect.webex.com/meet/riasali                   → riasali
+          https://zoom.us/j/12345678?pwd=abc                          → 12345678
+          https://meet.google.com/abc-defg-hij                        → abc-defg-hij
+          Just a number: 1234567890                                    → 1234567890
+        """
+        url = url.strip()
+
+        # Webex j.php?MTID=...
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if "MTID" in qs:
+            mtid = qs["MTID"][0]
+            # Use first 8 chars to keep filenames manageable
+            return mtid[:8] if len(mtid) > 8 else mtid
+
+        # Webex /meet/<room>
+        match = re.search(r"/meet/([^/?#]+)", url)
+        if match:
+            return match.group(1)
+
+        # Zoom /j/<meeting_id>
+        match = re.search(r"/j/(\d+)", url)
+        if match:
+            return match.group(1)
+
+        # Google Meet /xxx-xxxx-xxx
+        match = re.search(r"/([a-z]{3}-[a-z]{4}-[a-z]{3})", url)
+        if match:
+            return match.group(1)
+
+        # Bare numeric ID
+        cleaned = re.sub(r"[\s\-]", "", url)
+        if cleaned.isdigit():
+            return cleaned
+
+        # Fallback: last path segment
+        path = parsed.path.rstrip("/")
+        if path:
+            return path.split("/")[-1][:12]
+
+        return "unknown"
 
     @staticmethod
     async def _generate_black_video(path: str) -> None:
