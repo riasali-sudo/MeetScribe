@@ -38,15 +38,17 @@ class AudioRecorder:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         self._output_path = output_path
 
-        # FFmpeg: capture from PulseAudio default monitor, output 16kHz mono WAV
+        # FFmpeg: capture from PulseAudio monitor of our virtual sink.
+        # The MeetScribe.monitor source captures all audio output routed
+        # to the MeetScribe null sink (i.e., Chromium's meeting audio).
         cmd = [
             "ffmpeg",
-            "-y",                    # Overwrite output
-            "-f", "pulse",           # PulseAudio input
-            "-i", "default",         # Default PulseAudio source
-            "-ac", "1",              # Mono
-            "-ar", "16000",          # 16kHz (optimal for Whisper)
-            "-acodec", "pcm_s16le",  # 16-bit PCM
+            "-y",                              # Overwrite output
+            "-f", "pulse",                     # PulseAudio input
+            "-i", "MeetScribe.monitor",        # Our virtual sink's monitor
+            "-ac", "1",                        # Mono
+            "-ar", "16000",                    # 16kHz (optimal for Whisper)
+            "-acodec", "pcm_s16le",            # 16-bit PCM
             output_path,
         ]
 

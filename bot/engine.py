@@ -103,6 +103,9 @@ class BotEngine:
                     "--use-fake-device-for-media-stream",
                     f"--use-file-for-fake-video-capture={black_video}",
                     "--autoplay-policy=no-user-gesture-required",
+                    # Audio output: route to PulseAudio so we can capture it
+                    "--enable-audio-output",
+                    "--alsa-output-device=pulse",
                     f"--user-agent={get_realistic_user_agent()}",
                 ],
             )

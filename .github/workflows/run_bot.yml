@@ -59,12 +59,21 @@ jobs:
           export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
           sleep 1
-          pulseaudio --start --exit-idle-time=-1 || true
+          # PulseAudio daemon
+          pulseaudio --start --exit-idle-time=-1 --log-level=info || true
           sleep 1
+          # Virtual audio sink — all app audio routes here
           pactl load-module module-null-sink sink_name=MeetScribe sink_properties=device.description=MeetScribe || true
           pactl set-default-sink MeetScribe || true
           pactl set-default-source MeetScribe.monitor || true
+          # Verify audio setup
+          pactl info | grep -E "Default (Sink|Source)"
+          pactl list short sinks
+          pactl list short sources
+          # Export env vars for Chromium audio routing
           echo "DISPLAY=:99" >> $GITHUB_ENV
+          echo "PULSE_SINK=MeetScribe" >> $GITHUB_ENV
+          echo "PULSE_SERVER=unix:/run/user/$(id -u)/pulse/native" >> $GITHUB_ENV
 
       - name: Create output directories
         run: mkdir -p recordings transcripts
