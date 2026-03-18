@@ -75,6 +75,11 @@ class BotEngine:
         # Ensure output directory exists
         settings.recordings_dir.mkdir(parents=True, exist_ok=True)
 
+        # Generate a black video for the fake camera feed (replaces Chromium's
+        # flashing test pattern with a steady black frame)
+        black_video = str(settings.recordings_dir / "_black_feed.y4m")
+        await self._generate_black_video(black_video)
+
         # Setup graceful shutdown
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -90,6 +95,7 @@ class BotEngine:
                     "--disable-gpu",
                     "--use-fake-ui-for-media-stream",  # Auto-allow mic/camera
                     "--use-fake-device-for-media-stream",
+                    f"--use-file-for-fake-video-capture={black_video}",
                     "--autoplay-policy=no-user-gesture-required",
                     f"--user-agent={get_realistic_user_agent()}",
                 ],
@@ -205,6 +211,26 @@ class BotEngine:
         """Signal the bot to stop recording and leave."""
         logger.info("Shutdown requested")
         self._shutdown_requested = True
+
+    @staticmethod
+    async def _generate_black_video(path: str) -> None:
+        """Generate a 1-second black Y4M video for the fake camera feed.
+
+        Chromium loops this file, showing a steady black frame instead of
+        its default flashing test pattern. Uses ffmpeg which is already
+        a required dependency.
+        """
+        if Path(path).exists():
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-f", "lavfi", "-i",
+            "color=c=black:s=640x480:d=1:r=1",
+            "-pix_fmt", "yuv420p", path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        logger.info("Generated black video feed: %s", path)
 
 
 async def run_bot_cli(platform: str, meeting_url: str, display_name: str) -> BotResult:

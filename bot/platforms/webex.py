@@ -400,23 +400,38 @@ class WebexJoiner(PlatformJoiner):
             logger.warning("Error filling guest form: %s", e)
 
     async def _mute_av_in_frame(self, frame) -> None:
-        """Mute mic/camera in a frame."""
-        for text in ["Mute", "Stop video"]:
-            try:
-                btn = await frame.query_selector(f'button:has-text("{text}")')
-                if btn and await btn.is_visible():
-                    await btn.click()
-                    logger.info("Clicked '%s'", text)
-            except Exception:
-                continue
+        """Mute mic and stop camera in a frame.
 
-        for aria in ["Mute", "Stop video", "mute", "Turn off camera"]:
-            try:
-                btn = await frame.query_selector(f'button[aria-label*="{aria}" i]')
-                if btn and await btn.is_visible():
-                    await btn.click()
-            except Exception:
-                continue
+        Webex uses MDC web components so we need [role="button"] selectors
+        in addition to standard button selectors.
+        """
+        for text in ["Stop video", "Mute"]:
+            clicked = False
+            # Try role="button" first (MDC web components), then standard button
+            for sel in [
+                f'[role="button"]:has-text("{text}")',
+                f'button:has-text("{text}")',
+                f'[aria-label*="{text}" i]',
+            ]:
+                try:
+                    btn = await frame.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        logger.info("Clicked '%s' via %s", text, sel)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+            # Fallback: get_by_role
+            if not clicked:
+                try:
+                    btn = frame.get_by_role("button", name=text)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click()
+                        logger.info("Clicked '%s' via get_by_role", text)
+                except Exception:
+                    pass
 
     async def _click_join_button_anywhere(self, page: Page, guest_frame) -> bool:
         """Search ALL frames and the main page for the 'Join meeting' button.
