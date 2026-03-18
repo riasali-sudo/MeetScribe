@@ -125,30 +125,59 @@ class WebexJoiner(PlatformJoiner):
         return False
 
     async def is_in_meeting(self, page: Page) -> bool:
-        """Check if currently in an active Webex meeting."""
+        """Check if currently in an active Webex meeting.
+
+        Webex uses MDC web components (mdc-button, etc.), not standard
+        HTML buttons. We search across all frames using multiple strategies.
+        """
+        # Strategy 1: CSS selectors on main page and all frames
         indicators = [
+            'button:has-text("Mute")',
+            'button:has-text("Stop video")',
+            'button:has-text("Share")',
             'button:has-text("Leave")',
+            '[role="button"]:has-text("Mute")',
+            '[role="button"]:has-text("Stop video")',
+            '[role="button"]:has-text("Share")',
+            '[role="button"]:has-text("Leave")',
             '[aria-label*="Leave" i]',
+            '[aria-label*="Mute" i]',
             '[aria-label*="participant" i]',
-            '[data-test="participant-list"]',
-            '[data-test*="meeting"]',
-            '.meeting-controls',
         ]
-        for selector in indicators:
+        for frame in page.frames:
+            for selector in indicators:
+                try:
+                    el = await frame.query_selector(selector)
+                    if el and await el.is_visible():
+                        logger.info("In meeting detected: %s in %s", selector, frame.url[:60])
+                        return True
+                except Exception:
+                    continue
+
+        # Strategy 2: Check page/frame text for meeting indicators
+        meeting_keywords = [
+            "Mute", "Stop video", "Share", "Recording",
+            "Participants", "Leave meeting", "Moderated unmute",
+            "AI Assistant",
+        ]
+        for frame in page.frames:
             try:
-                el = await page.query_selector(selector)
-                if el and await el.is_visible():
+                text = await frame.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                )
+                if any(kw in text for kw in meeting_keywords):
+                    logger.info("In meeting detected via text in %s", frame.url[:60])
                     return True
             except Exception:
                 continue
 
-        # Check page text for meeting indicators
+        # Strategy 3: get_by_role on main page
         try:
-            body_text = await page.evaluate(
-                "() => document.body ? document.body.innerText : ''"
-            )
-            if any(kw in body_text for kw in ["Recording", "Participants", "Leave meeting"]):
-                return True
+            for name in ["Mute", "Stop video", "Share"]:
+                btn = page.get_by_role("button", name=name)
+                if await btn.count() > 0 and await btn.first.is_visible():
+                    logger.info("In meeting detected via get_by_role: %s", name)
+                    return True
         except Exception:
             pass
 
@@ -157,15 +186,32 @@ class WebexJoiner(PlatformJoiner):
     async def leave_meeting(self, page: Page) -> None:
         """Leave the Webex meeting."""
         logger.info("Leaving Webex meeting")
-        for text in ["Leave meeting", "Leave"]:
-            try:
-                btn = page.get_by_text(text, exact=False).first
-                if await btn.is_visible():
-                    await btn.click()
-                    await random_delay(2, 3)
-                    return
-            except Exception:
-                continue
+        # Search across all frames for the leave/end button (MDC web components)
+        for frame in page.frames:
+            for sel in [
+                '[role="button"]:has-text("Leave")',
+                'button:has-text("Leave")',
+                '[aria-label*="Leave" i]',
+                '[aria-label*="End meeting" i]',
+            ]:
+                try:
+                    el = await frame.query_selector(sel)
+                    if el and await el.is_visible():
+                        await el.click()
+                        logger.info("Left meeting via: %s", sel)
+                        await random_delay(2, 3)
+                        return
+                except Exception:
+                    continue
+
+        # Fallback: red X button (the leave button in Webex is a red circle)
+        try:
+            btn = page.get_by_role("button", name="Leave meeting")
+            if await btn.count() > 0:
+                await btn.first.click()
+                return
+        except Exception:
+            pass
 
     # ── Private helpers ───────────────────────────────────────────────
 
