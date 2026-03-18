@@ -48,8 +48,14 @@ class WebexJoiner(PlatformJoiner):
         await random_delay(5, 8)
 
         # Debug state
-        logger.info("Page title: %s | URL: %s", await page.title(), page.url)
+        title = await page.title()
+        logger.info("Page title: %s | URL: %s", title, page.url)
         await self._save_debug(page, "01_initial_load")
+
+        # Early exit: detect invalid/expired meeting links
+        if await self._is_error_page(page):
+            logger.error("Meeting link is invalid or expired")
+            return False
 
         # Step 1: Dismiss cookie banner
         await self._dismiss_cookies(page)
@@ -162,6 +168,28 @@ class WebexJoiner(PlatformJoiner):
                 continue
 
     # ── Private helpers ───────────────────────────────────────────────
+
+    async def _is_error_page(self, page: Page) -> bool:
+        """Detect Webex error pages (invalid link, expired, not found)."""
+        error_signals = [
+            "isn't valid",
+            "not found",
+            "error",
+            "expired",
+            "no longer available",
+            "meeting has ended",
+        ]
+        try:
+            title = (await page.title()).lower()
+            if "error" in title:
+                return True
+            body = await page.evaluate(
+                "() => document.body ? document.body.innerText.substring(0, 2000) : ''"
+            )
+            body_lower = body.lower()
+            return any(signal in body_lower for signal in error_signals)
+        except Exception:
+            return False
 
     async def _wait_for_guest_frame(self, page: Page):
         """Wait for the web.webex.com iframe to load with form elements.
