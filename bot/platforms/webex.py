@@ -81,11 +81,9 @@ class WebexJoiner(PlatformJoiner):
         # Step 4: Dismiss cookie banner again
         await self._dismiss_cookies(page)
 
-        # Step 5: Fill Name field inside iframe
-        await self._fill_input_in_frame(guest_frame, "name", display_name)
-
-        # Step 6: Fill Email field inside iframe
-        await self._fill_input_in_frame(guest_frame, "email", "meetscribe@example.com")
+        # Step 5: Fill Name and Email fields inside iframe
+        # The form has two visible text inputs: Name (1st) and Email (2nd)
+        await self._fill_guest_form(guest_frame, display_name, "meetscribe@example.com")
 
         # Step 7: Mute mic and stop video (may be in main page or iframe)
         await self._mute_av_in_frame(guest_frame)
@@ -279,41 +277,52 @@ class WebexJoiner(PlatformJoiner):
 
         logger.warning("Could not find 'Join from browser' modal button")
 
-    async def _fill_input_in_frame(self, frame, keyword: str, value: str) -> bool:
-        """Fill an input field in a frame by matching keyword in attributes."""
+    async def _fill_guest_form(self, frame, name: str, email: str) -> None:
+        """Fill the Name and Email fields in the guest join form.
+
+        The Webex guest form has two visible inputs in order:
+        1. Name (required)
+        2. Email Address (required)
+        We find all visible inputs and fill them positionally.
+        """
         try:
-            inputs = await frame.query_selector_all("input")
-            for inp in inputs:
+            # Log all inputs for debugging
+            all_inputs = await frame.query_selector_all("input")
+            visible_inputs = []
+            for inp in all_inputs:
+                is_visible = await inp.is_visible()
                 inp_type = await inp.get_attribute("type") or ""
                 inp_name = await inp.get_attribute("name") or ""
                 inp_id = await inp.get_attribute("id") or ""
                 inp_ph = await inp.get_attribute("placeholder") or ""
                 inp_aria = await inp.get_attribute("aria-label") or ""
+                logger.info(
+                    "Input: type=%s name=%s id=%s placeholder=%s aria=%s visible=%s",
+                    inp_type, inp_name, inp_id, inp_ph, inp_aria, is_visible,
+                )
+                if is_visible and inp_type not in ("hidden", "checkbox", "radio", "submit"):
+                    visible_inputs.append(inp)
 
-                attrs = f"{inp_type} {inp_name} {inp_id} {inp_ph} {inp_aria}".lower()
+            logger.info("Found %d visible inputs in guest frame", len(visible_inputs))
 
-                if keyword.lower() in attrs and await inp.is_visible():
-                    await inp.click()
-                    await inp.fill("")
-                    await inp.type(value, delay=random.randint(50, 120))
-                    logger.info("Filled '%s' input: name=%s id=%s ph=%s", keyword, inp_name, inp_id, inp_ph)
-                    return True
+            # Fill Name (first visible input)
+            if len(visible_inputs) >= 1:
+                await visible_inputs[0].click()
+                await visible_inputs[0].fill("")
+                await visible_inputs[0].type(name, delay=random.randint(50, 120))
+                logger.info("Filled Name field (1st visible input)")
 
-            # Fallback for "name": first visible text-like input
-            if keyword == "name":
-                for inp in inputs:
-                    inp_type = await inp.get_attribute("type") or "text"
-                    if inp_type in ("text", "") and await inp.is_visible():
-                        await inp.click()
-                        await inp.fill(value)
-                        logger.info("Filled first visible text input as '%s'", keyword)
-                        return True
+            # Fill Email (second visible input)
+            if len(visible_inputs) >= 2:
+                await visible_inputs[1].click()
+                await visible_inputs[1].fill("")
+                await visible_inputs[1].type(email, delay=random.randint(50, 120))
+                logger.info("Filled Email field (2nd visible input)")
+            else:
+                logger.warning("Only %d visible inputs found, expected at least 2", len(visible_inputs))
 
         except Exception as e:
-            logger.warning("Error filling %s: %s", keyword, e)
-
-        logger.warning("Could not find '%s' input in frame", keyword)
-        return False
+            logger.warning("Error filling guest form: %s", e)
 
     async def _mute_av_in_frame(self, frame) -> None:
         """Mute mic/camera in a frame."""
@@ -335,7 +344,24 @@ class WebexJoiner(PlatformJoiner):
                 continue
 
     async def _click_join_in_frame(self, frame) -> bool:
-        """Click the Join meeting button in a frame."""
+        """Click the Join meeting button in a frame.
+
+        The button may be disabled until form fields are filled.
+        We wait briefly then try to click, including force-click if needed.
+        """
+        await random_delay(2, 3)  # Let form validation settle
+
+        # Log all buttons for debugging
+        try:
+            buttons = await frame.query_selector_all("button")
+            for btn in buttons:
+                text = (await btn.inner_text()).strip()
+                disabled = await btn.get_attribute("disabled")
+                is_vis = await btn.is_visible()
+                logger.info("Button: text='%s' disabled=%s visible=%s", text[:50], disabled, is_vis)
+        except Exception:
+            pass
+
         # Try exact selectors
         for sel in [
             'button:has-text("Join meeting")',
@@ -344,21 +370,32 @@ class WebexJoiner(PlatformJoiner):
         ]:
             try:
                 el = await frame.wait_for_selector(sel, timeout=5000)
-                if el and await el.is_visible():
-                    await el.click()
-                    logger.info("Clicked join via: %s", sel)
-                    return True
+                if el:
+                    is_visible = await el.is_visible()
+                    disabled = await el.get_attribute("disabled")
+                    logger.info("Found join button: sel=%s visible=%s disabled=%s", sel, is_visible, disabled)
+
+                    if is_visible:
+                        try:
+                            await el.click(timeout=3000)
+                            logger.info("Clicked join via: %s", sel)
+                            return True
+                        except Exception:
+                            # Force click if regular click fails (e.g., disabled overlay)
+                            await el.click(force=True)
+                            logger.info("Force-clicked join via: %s", sel)
+                            return True
             except Exception:
                 continue
 
-        # Scan all buttons
+        # Scan all buttons as fallback
         try:
             buttons = await frame.query_selector_all("button")
             for btn in buttons:
                 text = (await btn.inner_text()).strip().lower()
-                if "join" in text and "browser" not in text and await btn.is_visible():
-                    await btn.click()
-                    logger.info("Clicked join button by scan: '%s'", text)
+                if "join" in text and "browser" not in text:
+                    await btn.click(force=True)
+                    logger.info("Force-clicked join by scan: '%s'", text)
                     return True
         except Exception:
             pass
