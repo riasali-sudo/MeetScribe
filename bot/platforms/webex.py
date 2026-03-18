@@ -64,45 +64,26 @@ class WebexJoiner(PlatformJoiner):
         await self._save_debug(page, "02_after_modal_click")
         logger.info("Page title: %s | URL: %s", await page.title(), page.url)
 
-        # The guest join form is inside an iframe (web.webex.com).
-        # Find the right frame to interact with.
-        target_frame = await self._find_guest_join_frame(page)
-
-        if target_frame:
-            logger.info("Found guest join iframe — interacting inside frame")
-        else:
-            logger.warning("No guest iframe found, falling back to main page")
-            target_frame = page
-
-        # Log frame state
-        try:
-            text = await target_frame.evaluate(
-                "() => document.body ? document.body.innerText.substring(0, 3000) : '(empty)'"
-            )
-            logger.info("Frame text:\n%s", text)
-        except Exception as e:
-            logger.warning("Could not read frame state: %s", e)
+        # The Webex web client uses Shadow DOM / Web Components.
+        # Standard selectors can't see inside shadow roots.
+        # We use JavaScript to pierce the shadow DOM and interact with elements.
 
         # Step 3: Dismiss cookie banner again (may reappear)
         await self._dismiss_cookies(page)
 
-        # Step 4: Fill in Name field (inside iframe)
-        await self._fill_name(target_frame, display_name)
+        # Step 4: Fill Name field (pierce shadow DOM if needed)
+        name_filled = await self._fill_name_js(page, display_name)
 
-        # Step 5: Fill in Email (inside iframe)
-        await self._fill_email(target_frame)
+        # Step 5: Fill Email field
+        await self._fill_email_js(page)
 
-        # Step 6: Mute mic and stop video (may be in main page or iframe)
-        await self._mute_av(page)
-        await self._mute_av(target_frame)
+        # Step 6: Mute mic and stop video
+        await self._mute_av_js(page)
 
         await self._save_debug(page, "03_before_join")
 
-        # Step 7: Click "Join meeting" button (inside iframe)
-        joined = await self._click_join_meeting(target_frame)
-        if not joined:
-            # Also try main page
-            joined = await self._click_join_meeting(page)
+        # Step 7: Click "Join meeting" button
+        joined = await self._click_join_meeting_js(page)
         if not joined:
             logger.error("Could not click 'Join meeting' button")
             await self._save_debug(page, "04_join_failed")
@@ -288,117 +269,202 @@ class WebexJoiner(PlatformJoiner):
 
         logger.warning("Could not find 'Join from browser' modal button")
 
-    async def _fill_name(self, target, name: str) -> None:
-        """Fill in the Name field. target can be Page or Frame."""
-        # Try attribute-based selectors (work on both Page and Frame)
-        selectors = [
-            'input[placeholder*="name" i]',
-            'input[aria-label*="name" i]',
-            'input[id*="name" i]',
-            'input[name*="name" i]',
-        ]
-        for sel in selectors:
-            try:
-                el = await target.wait_for_selector(sel, timeout=3000)
-                if el and await el.is_visible():
-                    await el.click()
-                    await el.fill("")
-                    await el.type(name, delay=random.randint(50, 120))
-                    logger.info("Filled Name field via: %s", sel)
-                    return
-            except Exception:
-                continue
+    async def _fill_name_js(self, page: Page, name: str) -> bool:
+        """Fill Name field using JS that pierces shadow DOM and iframes."""
+        result = await page.evaluate("""(name) => {
+            // Helper: recursively find inputs across shadow DOM and iframes
+            function findInputs(root) {
+                let inputs = [];
+                // Direct inputs
+                inputs.push(...root.querySelectorAll('input'));
+                // Shadow DOM
+                root.querySelectorAll('*').forEach(el => {
+                    if (el.shadowRoot) {
+                        inputs.push(...findInputs(el.shadowRoot));
+                    }
+                });
+                return inputs;
+            }
 
-        # Last resort: first visible text input in the frame
-        try:
-            inputs = await target.query_selector_all(
-                'input[type="text"], input:not([type])'
-            )
-            for inp in inputs:
-                if await inp.is_visible():
-                    await inp.click()
-                    await inp.fill(name)
-                    logger.info("Filled first visible text input as Name")
-                    return
-        except Exception:
-            pass
+            // Search main document
+            let allInputs = findInputs(document);
 
-        logger.warning("Could not find Name input field")
+            // Also search all iframes
+            document.querySelectorAll('iframe').forEach(iframe => {
+                try {
+                    let iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                    if (iframeDoc) {
+                        allInputs.push(...findInputs(iframeDoc));
+                    }
+                } catch(e) {} // cross-origin will fail
+            });
 
-    async def _fill_email(self, target) -> None:
-        """Fill in Email field. target can be Page or Frame."""
-        selectors = [
-            'input[type="email"]',
-            'input[placeholder*="email" i]',
-            'input[aria-label*="email" i]',
-            'input[id*="email" i]',
-            'input[name*="email" i]',
-        ]
-        for sel in selectors:
-            try:
-                el = await target.wait_for_selector(sel, timeout=2000)
-                if el and await el.is_visible():
-                    await el.click()
-                    await el.fill("meetscribe@example.com")
-                    logger.info("Filled Email field via: %s", sel)
-                    return
-            except Exception:
-                continue
+            // Log what we found
+            let info = allInputs.map(inp => ({
+                type: inp.type,
+                name: inp.name,
+                id: inp.id,
+                placeholder: inp.placeholder,
+                ariaLabel: inp.getAttribute('aria-label'),
+                visible: inp.offsetParent !== null
+            }));
+            console.log('Found inputs:', JSON.stringify(info));
 
-    async def _mute_av(self, target) -> None:
-        """Click Mute and Stop Video buttons. target can be Page or Frame."""
-        for aria in ["Mute", "Stop video", "Turn off camera", "mute"]:
-            try:
-                btn = await target.query_selector(f'button[aria-label*="{aria}" i]')
-                if btn and await btn.is_visible():
-                    await btn.click()
-                    logger.info("Clicked AV button: %s", aria)
-            except Exception:
-                continue
+            // Find the name input
+            for (let inp of allInputs) {
+                let attrs = (inp.name + inp.id + inp.placeholder + (inp.getAttribute('aria-label') || '')).toLowerCase();
+                if (attrs.includes('name') && !attrs.includes('email') && inp.offsetParent !== null) {
+                    inp.focus();
+                    inp.value = '';
+                    // Use native input setter to trigger React state
+                    let nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(inp, name);
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { filled: true, info: info };
+                }
+            }
 
-        # Also try text-based selectors
-        for sel in [
-            'button:has-text("Mute")',
-            'button:has-text("Stop video")',
-        ]:
-            try:
-                el = await target.query_selector(sel)
-                if el and await el.is_visible():
-                    await el.click()
-            except Exception:
-                continue
+            // Fallback: first visible text input
+            for (let inp of allInputs) {
+                if ((inp.type === 'text' || inp.type === '') && inp.offsetParent !== null) {
+                    inp.focus();
+                    let nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(inp, name);
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { filled: true, fallback: true, info: info };
+                }
+            }
 
-    async def _click_join_meeting(self, target) -> bool:
-        """Click 'Join meeting' button. target can be Page or Frame."""
-        selectors = [
-            'button:has-text("Join meeting")',
-            'button:has-text("Join Meeting")',
-            'button:has-text("Join")',
-            'input[value*="Join" i]',
-            '[role="button"]:has-text("Join")',
-        ]
-        for sel in selectors:
-            try:
-                el = await target.wait_for_selector(sel, timeout=5000)
-                if el and await el.is_visible():
-                    await el.click()
-                    logger.info("Clicked join via: %s", sel)
-                    return True
-            except Exception:
-                continue
+            return { filled: false, info: info };
+        }""", name)
 
-        # Scan all buttons
-        try:
-            buttons = await target.query_selector_all("button")
-            for btn in buttons:
-                text = (await btn.inner_text()).strip().lower()
-                if "join" in text and await btn.is_visible():
-                    await btn.click()
-                    logger.info("Clicked join button by scan: '%s'", text)
-                    return True
-        except Exception:
-            pass
+        logger.info("Name fill result: %s", result)
+        if result and result.get("filled"):
+            logger.info("Filled Name field via JS")
+            return True
+        logger.warning("Could not find Name input via JS")
+        return False
 
+    async def _fill_email_js(self, page: Page) -> None:
+        """Fill Email field using JS that pierces shadow DOM."""
+        await page.evaluate("""(email) => {
+            function findInputs(root) {
+                let inputs = [];
+                inputs.push(...root.querySelectorAll('input'));
+                root.querySelectorAll('*').forEach(el => {
+                    if (el.shadowRoot) inputs.push(...findInputs(el.shadowRoot));
+                });
+                return inputs;
+            }
+
+            let allInputs = findInputs(document);
+            document.querySelectorAll('iframe').forEach(iframe => {
+                try {
+                    let doc = iframe.contentDocument || iframe.contentWindow.document;
+                    if (doc) allInputs.push(...findInputs(doc));
+                } catch(e) {}
+            });
+
+            for (let inp of allInputs) {
+                let attrs = (inp.type + inp.name + inp.id + inp.placeholder + (inp.getAttribute('aria-label') || '')).toLowerCase();
+                if (attrs.includes('email') && inp.offsetParent !== null) {
+                    inp.focus();
+                    let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(inp, email);
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+            }
+            return false;
+        }""", "meetscribe@example.com")
+        logger.info("Attempted to fill Email field via JS")
+
+    async def _mute_av_js(self, page: Page) -> None:
+        """Mute mic and camera using JS that pierces shadow DOM."""
+        await page.evaluate("""() => {
+            function findButtons(root) {
+                let buttons = [];
+                buttons.push(...root.querySelectorAll('button'));
+                root.querySelectorAll('*').forEach(el => {
+                    if (el.shadowRoot) buttons.push(...findButtons(el.shadowRoot));
+                });
+                return buttons;
+            }
+
+            let allButtons = findButtons(document);
+            document.querySelectorAll('iframe').forEach(iframe => {
+                try {
+                    let doc = iframe.contentDocument || iframe.contentWindow.document;
+                    if (doc) allButtons.push(...findButtons(doc));
+                } catch(e) {}
+            });
+
+            for (let btn of allButtons) {
+                let text = (btn.textContent + (btn.getAttribute('aria-label') || '')).toLowerCase();
+                if ((text.includes('mute') || text.includes('stop video')) && btn.offsetParent !== null) {
+                    btn.click();
+                }
+            }
+        }""")
+        logger.info("Attempted to mute AV via JS")
+
+    async def _click_join_meeting_js(self, page: Page) -> bool:
+        """Click 'Join meeting' button using JS that pierces shadow DOM."""
+        result = await page.evaluate("""() => {
+            function findButtons(root) {
+                let buttons = [];
+                buttons.push(...root.querySelectorAll('button, [role="button"], input[type="submit"]'));
+                root.querySelectorAll('*').forEach(el => {
+                    if (el.shadowRoot) buttons.push(...findButtons(el.shadowRoot));
+                });
+                return buttons;
+            }
+
+            let allButtons = findButtons(document);
+            document.querySelectorAll('iframe').forEach(iframe => {
+                try {
+                    let doc = iframe.contentDocument || iframe.contentWindow.document;
+                    if (doc) allButtons.push(...findButtons(doc));
+                } catch(e) {}
+            });
+
+            // Log all visible buttons
+            let info = allButtons.filter(b => b.offsetParent !== null).map(b => ({
+                text: b.textContent.trim().substring(0, 50),
+                ariaLabel: b.getAttribute('aria-label'),
+                tag: b.tagName
+            }));
+            console.log('Visible buttons:', JSON.stringify(info));
+
+            // Find "Join meeting" button
+            for (let btn of allButtons) {
+                let text = (btn.textContent || '').trim().toLowerCase();
+                let aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                if ((text === 'join meeting' || aria === 'join meeting') && btn.offsetParent !== null) {
+                    btn.click();
+                    return { clicked: true, text: text, info: info };
+                }
+            }
+
+            // Fallback: any button containing "join" (but not "join from browser")
+            for (let btn of allButtons) {
+                let text = (btn.textContent || '').trim().toLowerCase();
+                if (text.includes('join') && !text.includes('browser') && !text.includes('app') && btn.offsetParent !== null) {
+                    btn.click();
+                    return { clicked: true, text: text, fallback: true, info: info };
+                }
+            }
+
+            return { clicked: false, info: info };
+        }""")
+
+        logger.info("Join meeting JS result: %s", result)
+        if result and result.get("clicked"):
+            logger.info("Clicked 'Join meeting' via JS")
+            return True
         return False
 
     async def _save_debug(self, page: Page, label: str) -> None:
