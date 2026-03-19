@@ -93,7 +93,7 @@ class BotEngine:
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
-                headless=True,
+                headless=False,  # Xvfb provides the display; non-headless enables audio
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
@@ -103,9 +103,8 @@ class BotEngine:
                     "--use-fake-device-for-media-stream",
                     f"--use-file-for-fake-video-capture={black_video}",
                     "--autoplay-policy=no-user-gesture-required",
-                    # Audio output: route to PulseAudio so we can capture it
-                    "--enable-audio-output",
-                    "--alsa-output-device=pulse",
+                    # Audio: keep in-process and force PulseAudio output
+                    "--disable-features=AudioServiceOutOfProcess",
                     f"--user-agent={get_realistic_user_agent()}",
                 ],
             )

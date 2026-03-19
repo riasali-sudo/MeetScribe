@@ -63,6 +63,9 @@ class AudioRecorder:
         self._is_recording = True
         logger.info("Recording started (PID: %d)", self._process.pid)
 
+        # Log PulseAudio state for debugging audio routing
+        await self._log_pulse_state()
+
     async def stop(self) -> str:
         """Stop recording and return the output file path."""
         if not self._is_recording or self._process is None:
@@ -104,6 +107,29 @@ class AudioRecorder:
             raise RuntimeError(f"Recording file is empty or missing: {output}")
 
         return output
+
+    @staticmethod
+    async def _log_pulse_state() -> None:
+        """Log PulseAudio sink-inputs and sources for debugging audio routing."""
+        for cmd_name, cmd in [
+            ("sink-inputs", ["pactl", "list", "short", "sink-inputs"]),
+            ("sources", ["pactl", "list", "short", "sources"]),
+            ("clients", ["pactl", "list", "short", "clients"]),
+        ]:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+                output = stdout.decode().strip()
+                if output:
+                    logger.info("PulseAudio %s:\n%s", cmd_name, output)
+                else:
+                    logger.warning("PulseAudio %s: (empty)", cmd_name)
+            except Exception as e:
+                logger.warning("Could not query PulseAudio %s: %s", cmd_name, e)
 
     async def cleanup(self) -> None:
         """Force-stop recording if still running."""
